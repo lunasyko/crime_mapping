@@ -1,0 +1,717 @@
+---
+title: "Violent Crime vs CCTV in Seoul, 2023"
+author: 'Seoyoung Ko (Luna)'
+date: "`r stringr::str_squish(format(Sys.Date(), '%e %B %Y'))`"
+tbl-cap-location: top
+embed-resources: true
+execute:
+  echo: false 
+---
+
+```{r setup}
+#| include: false
+
+# **WARNING**: `include: false` (above) means no output will appear for code in 
+
+# Load packages
+pacman::p_load(
+  classInt, dplyr, glue, ggplot2, ggrepel, gt, leaflet, mapview,
+  RColorBrewer, readr, sf, tidyverse
+  )
+```
+
+```{r load-data}
+#| include: false
+
+# No output will appear for code in this chunk,
+# so all warnings, messages, etc. will be hidden
+
+# Load all required datasets ---------------------------------------------------
+
+## Load the CCTV counts in Seoul by district
+seoul_cctv <- read_csv("https://raw.githubusercontent.com/lunasyko/crime_mapping/main/cctv_by_district.csv",
+  show_col_types = FALSE
+)
+
+## Load the crime counts in Seoul by district
+crime <- read_csv("https://raw.githubusercontent.com/lunasyko/crime_mapping/refs/heads/main/seoul_crime.csv",
+  show_col_types = FALSE
+)
+
+## Load the population data in Seoul by district
+seoul_pop <- read_csv("https://raw.githubusercontent.com/lunasyko/crime_mapping/refs/heads/main/seoul_population_density.csv",
+  show_col_types = FALSE
+)
+
+# Download and extract the municipality boundary data in Korea ---------------------
+## --- Boundaries via zip ---
+## Create a temporary file path with .zip extension
+zip_path <- tempfile(fileext = ".zip")
+
+## Download the zipped municipalities boundary file from GitHub (raw link)
+download.file(
+  url = "https://raw.githubusercontent.com/lunasyko/crime_mapping/main/korea_municipalities.json.zip",
+  # Saving it locally
+  destfile = zip_path,
+  # Write in binary mode
+  mode = "wb"
+)
+
+## Create a temporary directory to unzip into (inside system temp folder)
+unz_dir <- file.path(tempdir(), "municipality")
+
+## Unzip the downloaded file into that directory
+unzip(zip_path, exdir = unz_dir)
+
+# List all files in the unzipped folder that end with .json
+# 'full.names = TRUE' to get the full path to the file
+json_file <- list.files(unz_dir, pattern = "\\.json$", full.names = TRUE)
+
+# Read the GeoJSON file into R as an sf object
+# quiet = TRUE suppresses extra messages
+seoul_boundary <- st_read(json_file, quiet = TRUE) |>
+  filter(NAME_1 == "Seoul")
+```
+
+```{r wrangle}
+#| include: false
+# WRANGLE ----------------------------------------------------------------------
+# CCTV -------------------------------------------------------------------------
+## Create a new table that only contains district_label and CCTV counts in 2023
+cctv_total <- seoul_cctv |>
+  # Rename column '2023' cctv counts into 'cctv_counts'
+  rename(cctv_counts = "2023") |>
+  # Only bring in those two columns to this new table
+  select(district_label, cctv_counts)
+
+# Crime table ------------------------------------------------------------------
+## Crime table that only contains violent_crime_total in 2023 and its district
+crime_total <- crime |>
+  # Calculate the total violent crime occurences in 2023
+  mutate(
+    violent_crime_total = homicide_occ + robbery_occ + sexual_occ + assault_occ
+  ) |>
+  # Five-major crime count total, including theft_occ
+  mutate(
+    crime_total5 =
+      homicide_occ + robbery_occ + sexual_occ + assault_occ + theft_occ
+  ) |>
+  # To calculate the clearance rate ------------
+  # Add up the total clearance counts
+  mutate(crime_total_clear = homicide_clear + robbery_clear + sexual_clear + assault_clear + theft_clear) |>
+  # Formula for the clearance rate
+  mutate(
+    clearance_rate = (crime_total_clear / crime_total5) * 100
+  ) |>
+  # Only bring in those columns to this new table
+  select(district_label, violent_crime_total, clearance_rate, crime_total5)
+
+# Since the district keys are different in datasets,
+# create another column with addition of '-gu' in 'Name_2' column -------
+seoul_boundary <- seoul_boundary |>
+  mutate(
+    # Create a new column called district_label
+    district_label = paste0(
+      # Append "-gu" → "Yongsan-gu" from column 'NAME_2'
+      (NAME_2), "-gu"
+    )
+  )
+  
+# Create a table to merge boundary with other related data ---------------------
+district_crime <- seoul_boundary |>
+  # Only adds 'violent_crime_total'
+  left_join(
+    crime_total,
+    # Merge columns from crime_total, aligned by district_label
+    by = "district_label"
+  ) |>
+  # Merge population data with only relevant columns
+  left_join(
+    seoul_pop |>
+      select(
+        district_label,
+        `population (people)`,
+        `area (km^2)`
+      ),
+    by = "district_label"
+  ) |>
+  left_join(cctv_total, by = "district_label") |>
+  # Calculate violent crime rate per 10,000 residents
+  mutate(
+    violent_crime_rate_per_10k =
+      violent_crime_total / (`population (people)` / 10000)
+  ) |>
+  # Calculate the CCTV density (CCTVs per 10k residents)
+  mutate(cctv_per_10k = cctv_counts / (`population (people)` / 10000)) |>
+  # Calculate the CCTV to crime ratio for a ratio map
+  mutate(
+    cctv_to_crime_ratio = cctv_per_10k / violent_crime_rate_per_10k
+  )  |>
+  # Rank districts by CCTV-to-crime ratio (higher ratio = better rank)
+  mutate(
+    cctv_crime_rank = dense_rank(desc(cctv_to_crime_ratio))
+  )
+```
+
+> This report examines the relationship between violent crime and CCTV deployment across 25 districts of Seoul, South Korea. In particular, it investigates whether CCTV is more strongly associated with case clearance than with crime prevention.
+>
+> CCTV is often framed in crime science as a tool for Situational Crime Prevention, intended to increase risks for offenders by improving surveillance. Within Routine Activity Theory, CCTV can act as a capable guardian, reducing opportunities for crime where offenders and targets converge. At the same time, Deterrence Theory suggests CCTV may be more effective in increasing the certainty detection than in preventing crime directly.
+
+### Executive Summary
+
+-   Districts with higher violent crime tend to also have more CCTV. This suggests that cameras are often installed reactively in response to crime, not necessarily to prevent it.
+-   The relationship between CCTV density and violent crime is weak (R² ≈ 0.20), meaning cameras explain only about small proportion of crime differences across districts. Other factors, such as nightlife, footfall, and deprivation, likely drove most of the variation.
+-   The relationship between CCTV density and clearance rate is moderate (R² ≈ 0.57). This points to CCTV helping investigations after incidents, rather than preventing incidents in the first place.
+-   Stand-out districts: Jongno-gu and Jung-gu have high crime despite extensive CCTV; Yangcheon-gu and Guemcheon-gu show lower crime with relatively fewer cameras. These contrasts help identify gaps in coverage.
+
+> **Caveat**:
+>
+> CCTV presence does not directly cause crime reduction; it often reflects reactive deployment in high-crime areas.
+>
+> Police-recorded crime and CCTV data from 2023, while population estimate is from 2024.
+>
+> Crime and CCTV data were obtained from official Korean government datasets (in Korean). I translated and standardised the variables into English using Excel before analysis. The cleaned dataset is openly available on GitHub \[https://github.com/lunasyko/crime_mapping\].
+
+## Relationship between Violent crime rate and CCTV density
+
+### Side-by-side map
+
+```{r slider-map}
+#| label: fig-crime-cctv
+#| warning: false
+#| fig-width: 7
+#| fig-height: 7
+#| fig-cap: 'Violent crime vs CCTV density per 10,000 residents (same colour scale). On the left, the map shows CCTV density; on the right, it shows violent crime density'
+
+# Ensure CRS is web map friendly --> crs=4326
+district_crime <- st_transform(district_crime, 4326)
+
+# ----- Shared breaks & palette across BOTH maps -----
+# Combine values of crime rate and CCTV density into one vector
+# to share the same colour scale on both maps
+vals <- c(
+  district_crime$violent_crime_rate_per_10k,
+  district_crime$cctv_per_10k
+)
+
+# Take all numbers in 'vals', and split into 5-class quantile
+# (so both maps share the same legend intervals)
+brks <- classInt::classIntervals(vals, n = 5, style = "quantile")$brks
+# Rounds up for quantile numbers to be neat
+brks <- round(brks, 0)
+
+# Pick a 5-color palette (yellow → orange → red) on both maps
+# for easy comparison
+pal <- RColorBrewer::brewer.pal(5, "YlOrRd")
+
+# Crime map  -------------------------------------------------------------------
+m_crime <- mapview(
+  district_crime,
+  # Colour the map by this column
+  zcol = "violent_crime_rate_per_10k",
+  # Map legend title
+  layer.name = "Violent crimes per 10,000 residents",
+  # Clean basemap
+  map.types = "CartoDB.Positron",
+  # Use the shared palette
+  col.regions = pal,
+  # Use the shared breaks
+  at = brks,
+  # Show legend
+  legend = TRUE,
+  # Add district label + value in popup
+  popup = paste0(
+   "<b>District: </b>", district_crime$district_label, "<br>",
+   "<b>Violent Crime per 10,000 residents:</b>", "<br>",
+   round(district_crime$violent_crime_rate_per_10k, 1)
+)  )
+
+# CCTV map   -------------------------------------------------------------------
+m_cctv <- mapview(
+  district_crime,
+  # Colour the map by this column
+  zcol        = "cctv_per_10k",
+  # Map legend title
+  layer.name  = "CCTVs per 10,000 residents",
+  # Clean basemap
+  map.types   = "CartoDB.Positron",
+  # Use the shared palette
+  col.regions = pal,
+  # Use the shared breaks
+  at          = brks,
+  # Show legend
+  legend      = TRUE,
+  # Add district label + value in popup
+  popup = paste0(
+   "<b>District: </b>", district_crime$district_label, "<br>",
+   "<b>CCTVs per 10,000 residents:</b> ", "<br>",
+   round(district_crime$cctv_per_10k, 1)
+)  )
+ 
+# Side-by-side maps with a slider (provided by leafsync)
+m_crime | m_cctv
+```
+
+The side-by-side slide map, @fig-crime-cctv, use the same colour scale to quickly spot overlaps (high crime & high CCTV) and mismatches (high crime & low CCTV, or vice-versa). Consistent hot spots across both maps indicate reactive deployment, rather than prevention. For example, Jongno-gu and Mapo-gu show high crime with high CCTV (click to check the name of the district), suggesting reactive deployment of cameras in response to crime. Meanwhile, Gwanak-gu has high crime but low CCTV, which highlights a potential under-coverage issue.
+
+### CCTV-to-crime ratio map
+
+```{r map-ratio}
+#| label: fig-cctv-crime-ratio
+#| warning: false
+#| fig-width: 7
+#| fig-height: 7
+#| fig-cap: 'CCTV-to-Crime Ratio by district (CCTVs per violent crime).'
+
+
+# Shared palette (green = higher CCTV per crime, red = lower)
+pal_ratio <- colorNumeric(
+  palette = "YlGnBu", # yellow → green → blue
+  domain  = district_crime$cctv_to_crime_ratio
+)
+
+district_crime |>
+  # Construct column that can be used as a label for each prefecture on the map
+  mutate(
+    label = str_glue(
+      "{district_label}<br>",
+      "CCTV-to-crime ratio: {scales::number(cctv_to_crime_ratio, accuracy = 0.1)}<br>",
+      "Rank: {scales::ordinal(cctv_crime_rank)} of {nrow(district_crime)}"
+    )
+  ) |>
+  leaflet() |>
+  # Add base map
+  addProviderTiles(
+    "CartoDB.Positron",
+    # Prevent users from zooming in too far, e.g. to look at rates for small
+    # areas, since the data are only for prefectures and we don't want to make
+    # it easier for readers to fall for the ecological fallacy
+    options = providerTileOptions(maxZoom = 15)
+  ) |>
+  # Add prefecture polygons coloured by rate of violent crime
+  addPolygons(
+    fillColor = ~ pal_ratio(cctv_to_crime_ratio),
+    fillOpacity = 0.75,
+    # allow <br> in labels
+    label = ~ lapply(label, htmltools::HTML),
+    weight = 1,
+    color = "black"
+  ) |>
+  # Add legend
+  addLegend(
+    position = "bottomright",
+    pal = pal_ratio,
+    values = ~cctv_to_crime_ratio,
+    title = "CCTVs per<br>violent crime",
+    bins = 5
+  ) |>
+  # Add inset map
+  addMiniMap(toggleDisplay = TRUE, position = "bottomright")
+```
+
+@fig-cctv-crime-ratio highlights coverage relative to harm:
+
+-   **High ratio (darker blue)**: Districts with more CCTVs per violent crime indicates stronger surveillance coverage relative to crime burden. This may reflect either effective resourcing (more cameras installed) or lower overall crime pressure. Examples include Dobong-gu, Geumcheon-gu, and Yangcheon-gu, where CCTV appears comparatively abundant relative to crime levels.
+
+-   **Low ratio (light green - yellow)**: Districts with fewer CCTVs per violent crime suggest weaker coverage relative to crime burden. These are areas where high crime is not matched by equivalent surveillance capacity. For instance, Jung-gu and Yongsan-gu stand out as having surveillance deficits despite heavy crime concentration.
+
+### Scatter plot
+
+```{r scatter1}
+#| label: fig-scatter-cctv-violent
+#| warning: false
+#| fig-width: 7
+#| fig-height: 7
+#| fig-cap: 'Relationship between CCTV density and violent crime rate'
+
+
+# Linear Model for CCTV density and crime rate
+lm_fit1 <- lm(violent_crime_rate_per_10k ~ cctv_per_10k, data = district_crime)
+# Create a variable to print R^2 on the map
+r2_val1 <- summary(lm_fit1)$r.squared
+
+# Create a scatter plot -------------------------------------------------------
+district_crime |>
+  # Create labels only for clear outliers
+  # for top 10% quantile for either CCTV density or crime rate
+  mutate(
+    label = if_else(
+      # Condition i. violent crime rate is above 90th percentile (top 10%)
+      violent_crime_rate_per_10k > quantile(violent_crime_rate_per_10k, 0.9, na.rm = TRUE) |
+        # OR Condition ii. CCTV density is above 90th percentile (top 10%)
+        cctv_per_10k > quantile(cctv_per_10k, 0.9, na.rm = TRUE),
+      # If either condition is true, put the 'district_label' as the label
+      district_label,
+      # Otherwise, put NA(no labels)
+      NA_character_
+    )
+  ) |>
+  ggplot(aes(
+    # X-axis
+    x = cctv_per_10k,
+    # Y-axis
+    y = violent_crime_rate_per_10k,
+    # Labels for the selected outliers
+    label = label
+  )) +
+  # Add a vertical line at the median CCTV density
+  geom_vline(
+    xintercept = median(district_crime$cctv_per_10k, na.rm = TRUE),
+    # dashed-pattern
+    linetype = "22",
+    colour = "grey50"
+  ) +
+  # Add a horizontal line at the median crime rate
+  geom_hline(
+    yintercept = median(district_crime$violent_crime_rate_per_10k, na.rm = TRUE),
+    linetype = "22",
+    colour = "grey50"
+  ) +
+  # Add regression line with standard error
+  geom_smooth(
+    # Linear model
+    method = "lm",
+    formula = y ~ x,
+    colour = "grey20"
+  ) +
+  # Plot the points with purple
+  geom_point(alpha = 1, colour = "purple") +
+  # Repel overlapping labels (for outliers)
+  ggrepel::geom_label_repel(na.rm = TRUE, label.size = 0, lineheight = 1) +
+  # Axis formatting with comma separators (1000 --> 1,000)
+  scale_x_continuous(labels = scales::comma_format()) +
+  scale_y_continuous(labels = scales::comma_format()) +
+  # Titles and labels
+  labs(
+    title = "Relationship between CCTV density and violent crime rate",
+    subtitle = str_glue(
+      "Each dot is one Seoul district (2023). ",
+      "Dashed lines = median values."
+    ),
+    x = "CCTVs per 10,000 residents",
+    y = "Violent crimes per 10,000 residents"
+  ) +
+  # Add R^2 annotation near the top-right of the graph
+  annotate(
+    "text",
+    # Location of the R^2 in the map
+    x = max(district_crime$cctv_per_10k, na.rm = TRUE) * 0.8,
+    y = max(district_crime$violent_crime_rate_per_10k, na.rm = TRUE) * 0.9,
+    label = paste0(
+      "R² = ",
+      # Round the R^2 value to 2 decimal place
+      round(r2_val1, 2)
+    ),
+    # Left-aligned text
+    hjust = 0,
+    size = 5
+  ) +
+  # Clean, white background
+  theme_minimal()
+
+```
+
+According to @fig-scatter-cctv-violent, there is a **weak positive correlation** (R² ≈ 0.20) between CCTV density and violent crime rate across districts. In other words, districts with more CCTVs often also report higher violent crime rates.
+
+CCTV density only explains about 20% of variation in crime rates; the remaining 80% likely reflects other unmeasured factors, such as population density, socioeconomic variables, and nightlife concentration. This pattern is consistent with Routine Activity Theory, which highlights how crime opportunities emerge where motivated offenders, suitable targets, and limited guardianship converge—conditions often found in busy central districts. While CCTV is designed to act as a guardian, Situational Crime Prevention suggests that surveillance alone may not be sufficient to change offender's decision-making in high-risk environments.
+
+Outliers, shown with labels, illustrate important mismatches between surveillance and crime (either under-protected high-crime areas or well-protected low-crime areas):
+
+-   **Jongno-gu**: Extremely high violent crime rate and relatively high CCTV density highlights a district with consistent crime despite surveillance, possibly due to nightlife areas, tourism, or population flows.
+-   **Jung-gu**: Very high crime rate but moderate CCTV density indicates under-resourcing of surveillance relative to crime levels.
+-   **Yongsan-gu**: Above average crime and CCTV reflects concentration of high-risk urban activity zones
+-   **Yangcheon-gu & Geumcheon-gu**: Lower crime rates than expected given their CCTV density shows comparatively effective coverage or other protective social/environmental factors.
+
+In summary, CCTV appears to be deployed reactively, with more cameras installed where crime is already high. The evidence suggests CCTV is more of a response than a solution to violent crime.
+
+------------------------------------------------------------------------
+
+## Relationship between CCTV density and Clearance rate
+
+### Scatter plot
+
+```{r scatter2}
+#| label: fig-scatter-cctv-clearance
+#| fig-width: 7
+#| fig-height: 7
+#| fig-cap: 'Relationship between CCTV density and clearance rate'
+#| warning: false
+
+# Linear Model for CCTV density and clearnace rate
+lm_fit2 <- lm(cctv_per_10k ~ clearance_rate, data = district_crime)
+# Create a variable to print R^2 on the map
+r2_val2 <- summary(lm_fit2)$r.squared
+
+# Create a scatter plot -------------------------------------------------------
+district_crime |>
+  # Create labels only for clear outliers
+  # for top 10% quantile for either CCTV density or clearance rate
+  mutate(
+    label = if_else(
+      # Condition i. CCTV density is above 90th percentile (top 10%)
+      cctv_per_10k > quantile(cctv_per_10k, 0.9) |
+      # OR Condition ii. clearance rate is above 90th percentile (top 10%)
+      clearance_rate > quantile(clearance_rate, 0.9),
+      # If either condition is true, put the 'district_label' as the label
+      district_label,
+      # Otherwise, put NA(no labels)
+      NA_character_
+    )
+  ) |>
+  ggplot(aes(
+    # X-axis
+    x = cctv_per_10k,
+    # Y-axis
+    y = clearance_rate,
+    # Labels for the selected outliers
+    label = label
+  )) +
+  # Add a vertical line at the median CCTV density
+  geom_vline(
+    xintercept = median(district_crime$cctv_per_10k, na.rm = TRUE),
+    linetype = "22", colour = "grey50"
+  ) +
+  # Add a horizontal line at the median clearance rate
+  geom_hline(
+    yintercept = median(district_crime$clearance_rate, na.rm = TRUE),
+    linetype = "22", colour = "grey50"
+  ) +
+  # Add regression line with standard error
+  geom_smooth(
+    # Linear model
+    method = "lm",
+    formula = y ~ x,
+    colour = "grey20"
+  ) +
+  # Plot the points with blue
+  geom_point(alpha = 1, colour = "Blue") +
+  # Repel overlapping labels (for outliers)
+  ggrepel::geom_label_repel(na.rm = TRUE, label.size = 0, lineheight = 1) +
+  # Axis formatting with comma separators (1000 --> 1,000)
+  scale_x_continuous(labels = scales::comma_format()) +
+  scale_y_continuous(labels = scales::comma_format()) +
+  # Titles and labels
+  labs(
+    title = "Relationship between CCTV density and clearnace rate",
+    subtitle = str_glue(
+      "Each dot is one Seoul district (2023). ",
+      "Dashed lines = median values."
+    ),
+    x = "CCTVs per 10,000 residents",
+    y = "Clearance rate (%)"
+  ) +
+  # Add R^2 annotation near the top-right of the graph
+  annotate(
+    "text",
+    # Location of the R^2 in the map
+    x = max(district_crime$cctv_per_10k, na.rm = TRUE) * 0.8,
+    y = max(district_crime$clearance_rate, na.rm = TRUE) * 0.9,
+    # Round the R^2 value to 2 decimal place
+    label = paste0("R² = ", round(r2_val2, 2)),
+    hjust = 0, size = 5
+  ) +
+  theme_minimal()
+
+```
+
+@fig-scatter-cctv-clearance shows a **moderate positive relationship** (R² ≈ 0.57) between CCTV density and clearance rate. This means that districts with more CCTV tend to clear more cases. This supports CCTV's value for investigations, such as evidence and tracing, over prevention.
+
+This pattern aligns with Deterrence Theory, which emphasises the importance of the certainty of detection. Even if CCTV does not prevent incidents, its presence can increase the likelihood of offenders being identified and sanctioned, thereby strengthening responsibility after crimes occur.
+
+Examples illustrate this effect:
+
+-   **Jongno-gu** has both very high CCTV density and very high clearance rates, showing that CCTVs are clearly supporting investigations in this district.
+
+-   **Yangcheon-gu** has fewer cameras and lower clearance, which may indicate weaker surveillance coverage or investigation gaps due to lack of cameras.
+
+In summary, more cameras can help solve crimes, but cameras alone are not enough. It also depends on camera quality, retrieval speed, and how investigators use footage.
+
+------------------------------------------------------------------------
+
+## Reference Tables
+
+### Top/Bottom-5 Tables
+
+The top/Bottom-5 tables below highlight the extremes in both violent crime rates and CCTV density across Seoul's districts. They provide a quick comparison of where crime crime is concentrated and where CCTV coverage is more or least extensive.
+
+```{r crime-top5}
+#| label: tbl-crime-top5
+#| tbl-cap: "Districts with the highest violent crime rates in Seoul, 2023 (per 10,000 residents)."
+
+# Create a Top 5 districts table by violent crime rate -----------
+crime_top5 <- district_crime |>
+  # Removes geometry column
+  st_drop_geometry() |>
+  # Keep only district names and violent crime rate columns
+  select(district_label, violent_crime_rate_per_10k) |>
+  # Sort rows from highest to lowest crime rate
+  arrange(desc(violent_crime_rate_per_10k)) |>
+  # Keep only top 5
+  slice_head(n = 5) |>
+  # Convert to a gt table object
+  gt(rowname_col = "district_label") |>
+  # Format the crime rate numbers to 1 decimal place
+  fmt_number(columns = violent_crime_rate_per_10k, decimals = 1) |>
+  # Rename the column header
+  cols_label(
+    violent_crime_rate_per_10k = md("Violent crimes per<br>10,000 residents")
+  ) |>
+  # Apply purple colour scale to highlight higher/lower values visually
+  data_color(columns = violent_crime_rate_per_10k, palette = "Purples") |>
+  # Add table header
+  tab_header(title = md("**Top 5** by violent crime rate"))
+
+# Print the table
+crime_top5
+```
+
+```{r crime-bottom5}
+#| label: tbl-crime-bottom5
+#| tbl-cap: "Districts with the lowest violent crime rates in Seoul, 2023 (per 10,000 residents)."
+
+# Create a Bottom 5 districts table by violent crime rate ----------------------
+crime_bottom5 <- district_crime |>
+  # Removes geometry column
+  st_drop_geometry() |>
+  # Keep only district names and violent crime rate columns
+  select(district_label, violent_crime_rate_per_10k) |>
+  # Sort rows from lowest to highest crime rate
+  arrange(violent_crime_rate_per_10k)  |>
+  # Keep only bottom 5
+  slice_head(n = 5) |>
+  # Convert to a gt table object for aesthetic
+  gt(rowname_col = "district_label") |>
+  # Format the crime rate numbers to 1 decimal place
+  fmt_number(columns = violent_crime_rate_per_10k, decimals = 1) |>
+  # Rename the column header
+  cols_label(
+    violent_crime_rate_per_10k = md("Violent crimes per<br>10,000 residents")
+    ) |>
+  # Apply purple colour scale to highlight higher/lower values visually
+  data_color(columns = violent_crime_rate_per_10k, palette = "Purples") |>
+  # Add table header
+  tab_header(title = md("**Bottom 5** by violent crime rate"))
+
+# Print the table
+crime_bottom5
+```
+
+```{r cctv-top5}
+#| label: tbl-cctv-top5
+#| tbl-cap: "Districts with the highest CCTV density in Seoul, 2023 (per 10,000 residents)."
+
+# Create a Top 5 districts table by CCTV density -------------------------------
+cctv_top5 <- district_crime |>
+  # Removes geometry column
+  st_drop_geometry() |>
+  # Keep only district names and CCTV density columns
+  select(district_label, cctv_per_10k) |>
+  # Sort rows from descending order
+  arrange(desc(cctv_per_10k)) |>
+  # Keep only top 5
+  slice_head(n = 5) |>
+  # Convert to a gt table object for aesthetic
+  gt(rowname_col = "district_label") |>
+  # Format the crime rate numbers to 1 decimal place
+  fmt_number(columns = cctv_per_10k, decimals = 1) |>
+  # Rename the column header
+  cols_label(
+    cctv_per_10k = md("CCTVs per<br>10,000 residents")
+  ) |>
+  # Apply 'YlGn' colour scale (higher = green, lower = yellow)
+  data_color(columns = cctv_per_10k, palette = "YlGn")  |>
+  # Add table header
+  tab_header(title = md("**Top 5** by CCTV density"))
+
+# Print the table  
+cctv_top5
+```
+
+```{r cctv-bottom5}
+#| label: tbl-cctv-bottom5
+#| tbl-cap: "Districts with the lowest CCTV density in Seoul, 2023 (per 10,000 residents)."
+
+# Create a Bottom 5 districts table by CCTV density -------------------------------
+cctv_bottom5 <- district_crime |>
+  # Removes geometry column
+  st_drop_geometry() |>
+  # Keep only district names and CCTV density columns
+  select(district_label, cctv_per_10k) |>
+  # Sort rows from lowest to highest order
+  arrange(cctv_per_10k) |>
+  # Keep only bottom 5
+  slice_head(n = 5) |>
+  # Convert to a gt table object for aesthetic
+  gt(rowname_col = "district_label") |>
+  # Format the crime rate numbers to 1 decimal place
+  fmt_number(columns = cctv_per_10k, decimals = 1) |>
+  # Rename the column header
+  cols_label(
+    cctv_per_10k = md("CCTVs per<br>10,000 residents")
+  ) |>
+  # Apply 'YlGn' colour scale (higher = green, lower = yellow)
+  data_color(columns = cctv_per_10k, palette = "YlGn") |>
+  # Add table header
+  tab_header(title = md("**Bottom 5** by CCTV density"))
+
+# Print the table
+cctv_bottom5
+```
+
+### Summary table
+
+Use this as a **reference sheet** for cross-comparing crime burden against resources.
+
+```{r summary}
+#| label: tbl-summary
+#| tbl-cap: "Crime, CCTV, clearance, and area data are from 2023. Population estimates are from 2024."
+
+# Produce a summary table of crime counts in each Seoul Districts --------------
+district_crime |>
+  # removes the geometry column
+  st_drop_geometry() |>
+  # Rename columns with spaces/symbols into cleaner names
+  rename(
+    population_people = 'population (people)',
+    area_km2          = 'area (km^2)'
+  ) |>
+  # Convert new column names to snake case
+  # janitor::clean_names() |>
+  # Choose only the columns we want to show in the table
+  select(
+    district_label, population_people, area_km2, violent_crime_total,
+    violent_crime_rate_per_10k, cctv_counts,
+    cctv_per_10k, clearance_rate
+  ) |>
+  # Convert to a gt table object for aesthetic
+  gt(rowname_col = "district_label") |>
+  # Format numbers with thousand separators and no decimals
+  fmt_number(columns = where(is.numeric), decimals = 0) |>
+  # Re-labels column headers for readability
+  cols_label(
+    "violent_crime_total" ~ "Total Violent Crimes",
+    # 'md()' to allow line breaks (<br>) or formatting
+    "violent_crime_rate_per_10k" ~ md("Violent Crimes<br>per 10,000 residents"),
+    "cctv_counts" ~ "Total CCTVs",
+    "cctv_per_10k" ~ md("CCTVs<br>per 10,000 residents"),
+    "clearance_rate" ~ "Clearance Rate (%)",
+    "population_people" ~ "Population (people)",
+    "area_km2" ~ "Area (km^2)"
+  ) |>
+  # Adds table header
+  tab_header(title = md(
+    "**District-Level Summary**: Crime, CCTV, and Demographics (Seoul) "
+  ))
+```
+
+# Conclusion
+
+This analysis of Seoul's 25 districts show that CCTV and violent crime are weakly related. Districts with more cameras often also record more crime, suggesting that cameras are usually installed reactively in response to existing problems rather than acting as a preventive tool.
+
+By contrast, CCTV shows a moderate positive association with case clearance rates. Districts with higher CCTV density tend to resolve more cases. This supports the view that cameras are more effective for investigation and evidence-gathering than for preventing incidents outright.
+
+Outlier districts highlight areas of concern and opportunity. For example, Jung-gu and Gwanak-gu record high levels of crime but relatively low CCTV coverage, suggesting possible under-provision of surveillance resources. Meanwhile, districts such as Yangcheon-gu and Geumcheon-gu have stronger coverage relative to crime, which may reflect effective deployment or protective social factors.
+
+These findings also align with established crime theories. Routine Activity Theory helps explain why high-crime districts attract reactive CCTV deployment, as central areas create frequent opportunities where offenders and targets converge. Situational Crime Prevention frames CCTV as a situational tool to increase risk, but shows it is most effective when combined with other measures such as lighting, guardianship, or policing presence. Finally, Deterrence Theory explains why CCTV contributes more to case resolution than to prevention, by increasing the perceived certainty of detection rather than removing the opportunity to offend.
+
+Overall, CCTV should be viewed as one element within a broader crime prevention strategy. While valuable for supporting investigations, cameras alone cannot explain or control most variation in crime. To reduce violent crime effectively, CCTV deployment needs to be complemented by social, environmental, policing interventions
